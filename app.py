@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Streamlit app for iCalendar to CSV Extractor with Patient Matching
+Complete version with all sophisticated matching logic
 """
 
 import streamlit as st
@@ -190,226 +191,470 @@ def extract_appointments(calendar: Calendar, months: List[int], year: int) -> Li
     appointments.sort(key=lambda x: (datetime.strptime(x['start_date'], '%m/%d/%Y'), x['start_time']))
     return appointments
 
+def parse_patient_name(name: str) -> Tuple[str, str]:
+    """Parse 'LastName, FirstName' format with support for complex names."""
+    name = str(name).strip()
+    
+    if ',' in name:
+        parts = name.split(',', 1)
+        last_name = parts[0].strip()
+        first_name = parts[1].strip() if len(parts) > 1 else ""
+        
+        # Handle complex last names like "Russell (Kwon)"
+        if '(' in last_name:
+            main_last_name = last_name.split('(')[0].strip()
+            return first_name, main_last_name
+        
+        return first_name, last_name
+    else:
+        # Fallback: split and assume last word is last name
+        parts = name.split()
+        if len(parts) >= 2:
+            first_name = ' '.join(parts[:-1])
+            last_name = parts[-1]
+        else:
+            first_name = ""
+            last_name = name
+        return first_name, last_name
+
 def load_patient_list(excel_content: bytes) -> Dict[str, PatientData]:
-    """Load patient list from Excel file content"""
+    """Load patient list from Excel file with enhanced indexing"""
     try:
         df = pd.read_excel(io.BytesIO(excel_content), header=None)
         patients: Dict[str, PatientData] = {}
 
         for _, row in df.iterrows():
-            try:
-                raw_last = str(row[0])
-                raw_first = str(row[1]) if len(row) > 1 else ""
-                raw_prn = str(row[2]) if len(row) > 2 else ""
-                raw_insurance = str(row[3]) if len(row) > 3 else ""
-                raw_doctor = str(row[4]) if len(row) > 4 else ""
+            # Assuming columns: 0=Name, 1=PRN, 2=Insurance, 4=Doctor
+            name = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            prn = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            insurance = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
+            doctor = str(row.iloc[4]).strip() if len(row) > 4 and pd.notna(row.iloc[4]) else ""
 
-                if pd.isna(row[0]):
-                    continue
-
-                first_name = raw_first.strip() if not pd.isna(row[1]) else ""
-                last_name = raw_last.strip()
-                prn = raw_prn.strip() if not pd.isna(row[2]) else ""
-                insurance = raw_insurance.strip() if not pd.isna(row[3]) else ""
-                doctor = raw_doctor.strip() if not pd.isna(row[4]) else ""
-
-                patient = PatientData(first_name, last_name, prn, insurance, doctor)
-                full_name = patient.full_name()
-                patients[full_name] = patient
-                
-            except Exception as e:
-                logger.warning(f"Could not process row: {e}")
+            if not name or name.lower() == "nan":
                 continue
 
+            # parse name
+            first_name, last_name = parse_patient_name(name)
+
+            # build the patient object
+            patient = PatientData(first_name, last_name, prn, insurance, doctor)
+
+            # Enhanced indexing for better matching
+            first_key = _normalize_token(first_name)
+            last_key = _normalize_token(last_name)
+            name_key = f"{first_key}_{last_key}"
+            patients[name_key] = patient
+            
+            # Index by display "last, first" too
+            disp_key = f"{_normalize_token(last_name)}, {_normalize_token(first_name)}"
+            if f"display_{disp_key}" not in patients:
+                patients[f"display_{disp_key}"] = patient
+
+            # Index by surname key to help last-name-only resolution
+            surname_key = _surname_key(last_name)
+            patients.setdefault(f"lnk_{surname_key}", []).append(patient)
+
+            # Index by PRN for quick lookup
+            if prn:
+                patients[f"prn_{_normalize_token(prn)}"] = patient
+
+        logger.info(f"Successfully loaded {len(patients)} patient records")
         return patients
     except Exception as e:
         raise Exception(f"Error loading patient list: {str(e)}")
 
-def extract_name_and_codes(appointment_title: str) -> List[Tuple[str, str]]:
-    """Extract patient names and procedure codes from appointment title"""
-    title = appointment_title.strip()
-    
-    if not title or title == "No Title":
-        return []
-    
-    # Extract metadata (TMS/CPT codes)
-    metadata_parts = []
-    
-    # Pattern 1: TMS#number
-    tms_matches = re.findall(r'\bTMS#(\d+)\b', title, re.IGNORECASE)
-    for tms in tms_matches:
-        metadata_parts.append(f"TMS#{tms}")
-    
-    # Pattern 2: CPT code format (e.g., 99213, 90837)
-    cpt_matches = re.findall(r'\b(9\d{4})\b', title)
-    for cpt in cpt_matches:
-        if cpt not in tms_matches:  # Avoid duplicates
-            metadata_parts.append(f"CPT:{cpt}")
-    
-    # Pattern 3: F codes (e.g., F43.10)
-    f_code_matches = re.findall(r'\b(F\d{2}\.\d{1,2})\b', title, re.IGNORECASE)
-    for f_code in f_code_matches:
-        metadata_parts.append(f_code.upper())
-    
-    metadata = ", ".join(metadata_parts) if metadata_parts else ""
-    
-    # Clean title for name extraction
-    clean_title = title
-    for pattern in [r'\bTMS#\d+\b', r'\b9\d{4}\b', r'\bF\d{2}\.\d{1,2}\b',
-                   r'\(.*?\)', r'\[.*?\]', r'\d{1,2}/\d{1,2}', r'#\d+']:
-        clean_title = re.sub(pattern, ' ', clean_title, flags=re.IGNORECASE)
-    
-    # Handle "and" or "&" for multiple patients
-    separators = [' and ', ' & ', ', ']
-    names = [clean_title]
-    
-    for sep in separators:
-        new_names = []
-        for name in names:
-            if sep in name.lower() or sep.strip() in name:
-                parts = re.split(re.escape(sep), name, flags=re.IGNORECASE)
-                new_names.extend(parts)
-            else:
-                new_names.append(name)
-        names = new_names
-    
-    results = []
-    for name in names:
-        name = re.sub(r'\s+', ' ', name).strip()
-        if name and not name.isdigit():
-            results.append((name, metadata))
-    
-    return results if results else [(clean_title.strip(), metadata)]
+def calculate_string_similarity(s1: str, s2: str) -> float:
+    """Calculate similarity between two strings using SequenceMatcher"""
+    s1 = _normalize_token(s1)
+    s2 = _normalize_token(s2)
+    return SequenceMatcher(None, s1, s2).ratio()
 
-def find_best_patient_match(name: str, patients: Dict[str, PatientData], 
-                           threshold: float = 0.75) -> Optional[Tuple[PatientData, float, bool]]:
-    """Find the best matching patient for a given name using fuzzy matching"""
+def match_patient_by_lastname_only(candidate_last: str,
+                                   patients: Dict[str, PatientData],
+                                   min_sim: float = 0.65,
+                                   max_results: int = 5) -> List[Tuple[PatientData, float]]:
+    cand = _normalize_token(candidate_last)
+    cand_key = _surname_key(candidate_last)
+
+    patient_to_score: Dict[PatientData, float] = {}
+
+    # Fast path from surname bucket
+    bucket = patients.get(f"lnk_{cand_key}", [])
+    for p in bucket:
+        patient_to_score[p] = max(patient_to_score.get(p, 0), 0.95)
+
+    # Fuzzy sweep over real PatientData entries
+    for key, p in patients.items():
+        if key.startswith(("prn_", "lnk_")): 
+            continue
+        if not isinstance(p, PatientData): 
+            continue
+
+        pl = _normalize_token(p.last_name or "")
+        best = calculate_string_similarity(cand, pl)
+        for token in pl.split():
+            best = max(best, calculate_string_similarity(cand, token))
+
+        # Armenian tail nudge
+        if cand.endswith("yan") and pl.endswith("yan"):
+            core_sim = calculate_string_similarity(cand[:-3], pl[:-3])
+            if core_sim >= 0.65:
+                best = max(best, 0.90)
+
+        # Additional nudge for ian/yan variations
+        if (cand.endswith("yan") and pl.endswith("ian")) or (cand.endswith("ian") and pl.endswith("yan")):
+            core_sim = calculate_string_similarity(cand[:-3], pl[:-3])
+            if core_sim >= 0.65:
+                best = max(best, 0.90)
+
+        if best >= min_sim:
+            patient_to_score[p] = max(patient_to_score.get(p, 0), best)
+
+    # Sort by score desc
+    hits = sorted(patient_to_score.items(), key=lambda x: x[1], reverse=True)[:max_results]
+    return hits
+
+def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional[PatientData], bool, float]:
+    first_name, last_name = parse_patient_name(name)
+
+    # Normalized exacts FIRST
+    first_lower = _normalize_token(first_name)
+    last_lower = _normalize_token(last_name)
+    has_full_name = bool(first_lower) and bool(last_lower)
+
+    if has_full_name:
+        # Exact by display key
+        disp_key = f"display_{last_lower}, {first_lower}"
+        if disp_key in patients and isinstance(patients[disp_key], PatientData):
+            return patients[disp_key], False, 1.0
+
+        # Exact by canonical key
+        name_key = f"{first_lower}_{last_lower}"
+        if name_key in patients and isinstance(patients[name_key], PatientData):
+            return patients[name_key], False, 1.0
+
+    # Fuzzy matching
+    first_parts = [part.strip() for part in first_lower.replace(',', ' ').split() if part.strip()]
+    last_parts = [part.strip() for part in last_lower.replace(',', ' ').split() if part.strip()]
+    matches = []
     
-    if not name or not patients:
-        return None
+    for key, patient in patients.items():
+        if key.startswith(('prn_', 'lnk_')):
+            continue
+        if not isinstance(patient, PatientData):
+            continue
+            
+        patient_first = _normalize_token(patient.first_name)
+        patient_last = _normalize_token(patient.last_name)
+        
+        # Calculate similarity scores
+        first_name_score = 0
+        last_name_score = 0
+        
+        if first_parts and patient_first:
+            max_first_score = 0
+            for first_part in first_parts:
+                sim = calculate_string_similarity(first_part, patient_first)
+                max_first_score = max(max_first_score, sim)
+                
+                for patient_word in patient_first.split():
+                    sim = calculate_string_similarity(first_part, patient_word)
+                    max_first_score = max(max_first_score, sim)
+            
+            first_name_score = max_first_score
+        
+        if last_parts and patient_last:
+            max_last_score = 0
+            # Check surname key equality
+            if last_parts:
+                for last_part in last_parts:
+                    if _surname_key(last_part) == _surname_key(patient_last):
+                        max_last_score = max(max_last_score, 0.98)
+            for last_part in last_parts:
+                sim = calculate_string_similarity(last_part, patient_last)
+                max_last_score = max(max_last_score, sim)
+                
+                for patient_word in patient_last.split():
+                    sim = calculate_string_similarity(last_part, patient_word)
+                    max_last_score = max(max_last_score, sim)
+            
+            last_name_score = max_last_score
+        
+        # Acceptance gate
+        if (first_name_score >= 0.60 and last_name_score >= 0.60) or \
+            (last_name_score >= 0.90 and first_name_score >= 0.50):
+            overall_score = (first_name_score + last_name_score) / 2
+            matches.append((patient, overall_score, first_name_score, last_name_score))
     
-    name = _clean_person_token(name)
-    name_norm = _normalize_token(name)
+    if matches:
+        matches.sort(key=lambda x: x[1], reverse=True)
+        best_match = matches[0]
+        is_ambiguous = len([m for m in matches if m[1] >= 0.85]) > 1
+        return best_match[0], is_ambiguous, best_match[1]
     
-    # Try exact match first
-    for patient_key, patient in patients.items():
-        if name_norm == _normalize_token(patient.full_name()):
-            return (patient, 1.0, False)
+    # Fallback: first-initial + last-name
+    raw_tokens = re.findall(r"[A-Za-z][A-Za-z'-]+", name)
+    for tok in raw_tokens:
+        cand_ln = _normalize_token(tok)
+        if patients.get(f"lnk_{_surname_key(cand_ln)}"):
+            ln_matches = match_patient_by_lastname_only(cand_ln, patients)
+            if ln_matches:
+                top = ln_matches[0]
+                return top[0], False, max(0.90, top[1])
+
+    # Fallback: lastname-only when no full name
+    if not has_full_name:
+        for candidate_last in filter(None, [last_lower, first_lower]):
+            ln_matches = match_patient_by_lastname_only(candidate_last, patients)
+            if ln_matches:
+                top = ln_matches[0]
+                is_ambiguous = False
+                if len(ln_matches) > 1:
+                    diff = top[1] - ln_matches[1][1]
+                    is_ambiguous = diff < 0.10
+                return top[0], is_ambiguous, top[1]
     
-    # Parse the input name
-    name_parts = name.split(',')
-    if len(name_parts) == 2:
-        input_last = name_parts[0].strip()
-        input_first = name_parts[1].strip()
+    # Last-resort: exact display equality
+    display_key = f"{_normalize_token(last_name)}, {_normalize_token(first_name)}"
+    for key, p in patients.items():
+        if key.startswith(("prn_", "lnk_")) or not isinstance(p, PatientData):
+            continue
+        disp = f"{_normalize_token(p.last_name)}, {_normalize_token(p.first_name)}"
+        if disp == display_key:
+            return p, False, 1.0
+
+    return None, False, 0.0
+
+def extract_metadata(title: str) -> Tuple[str, str]:
+    """Extract CPT codes and TMS session numbers from title"""
+    metadata = ""
+    
+    # Extract TMS session numbers
+    tms_pattern = r'TMS\s*#?\s*(\d+)'
+    tms_match = re.search(tms_pattern, title, re.IGNORECASE)
+    if tms_match:
+        metadata = f"TMS #{tms_match.group(1)}"
+        title = re.sub(tms_pattern, '', title, flags=re.IGNORECASE).strip()
+    
+    # Extract CPT-like codes
+    cpt_pattern = r'\b(\d{2}/\d{2})\b'
+    cpt_match = re.search(cpt_pattern, title)
+    if cpt_match:
+        if metadata:
+            metadata += f" | CPT {cpt_match.group(1)}"
+        else:
+            metadata = f"CPT {cpt_match.group(1)}"
+        title = re.sub(cpt_pattern, '', title).strip()
+    
+    return title.strip(), metadata
+
+def normalize_name_format(name: str) -> str:
+    """Convert 'FirstName LastName' to 'LastName, FirstName' format"""
+    name = name.strip()
+    
+    if ',' in name:
+        return name
+    
+    parts = [p for p in name.split() if p]
+    
+    if len(parts) == 0:
+        return name
+    elif len(parts) == 1:
+        return name
+    elif len(parts) == 2:
+        return f"{parts[1]}, {parts[0]}"
     else:
-        name_tokens = name.split()
-        if len(name_tokens) >= 2:
-            input_last = name_tokens[-1]
-            input_first = ' '.join(name_tokens[:-1])
-        elif len(name_tokens) == 1:
-            input_last = name_tokens[0]
-            input_first = ""
+        last_name = parts[-1]
+        first_names = ' '.join(parts[:-1])
+        return f"{last_name}, {first_names}"
+
+def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[Tuple[str, str]]:
+    """
+    Return [(normalized_name, metadata)] from a raw appointment title.
+    Handles multiple name formats and splits multiple patients.
+    """
+    clean_title, metadata = extract_metadata(title)
+    clean_title = _clean_person_token(clean_title)
+
+    names: List[Tuple[str, str]] = []
+
+    # Split around " and " as a last-name joiner when there's no commas
+    if " and " in clean_title and "," not in clean_title:
+        parts = [p.strip() for p in clean_title.split(" and ") if p.strip()]
+        if len(parts) == 2 and all(" " not in p for p in parts):
+            return [(p, metadata) for p in parts]
+
+    # Comma-based split first
+    parts = [p.strip() for p in clean_title.split(",") if p.strip()]
+    if len(parts) == 0:
+        return []
+    if len(parts) == 1:
+        # Single segment -> normalize
+        normalized = normalize_name_format(parts[0])
+        words = parts[0].split()
+        if len(words) == 3:
+            ln, f1, f2 = words[0], words[1], words[2]
+            if f"lnk_{_surname_key(ln)}" in patients:
+                return [(f"{ln}, {f1}", metadata), (f"{ln}, {f2}", metadata)]
+
+        if normalized and "," in normalized:
+            last, firsts = [p.strip() for p in normalized.split(",", 1)]
+            # Expand multi-firsts
+            first_parts = [f for f in firsts.split() if f.isalpha() and len(f) > 1]
+            if len(first_parts) > 1:
+                for fp in first_parts:
+                    names.append((f"{last}, {fp}", metadata))
+                return names
+            if firsts:
+                return [(f"{last}, {firsts}", metadata)]
+        return [(parts[0], metadata)]
+    
+    # Special-case: "Last First, First" -> same last, two people
+    if len(parts) >= 2:
+        seg0_words = parts[0].split()
+        if len(seg0_words) == 2 and parts[1]:
+            last_candidate, first0 = seg0_words[0].strip(), seg0_words[1].strip()
+            if f"lnk_{_surname_key(last_candidate)}" in patients:
+                out = [(f"{last_candidate}, {first0}", metadata)]
+                for j in range(1, len(parts)):
+                    for fn in parts[j].split():
+                        fn = _clean_person_token(fn)
+                        if fn.isalpha() and len(fn) > 1:
+                            out.append((f"{last_candidate}, {fn}", metadata))
+                return out
+
+    # Check if all tokens are single words
+    tokens = [_clean_person_token(p) for p in parts if p]
+    if all((" " not in t and t.replace("-", "").replace("'", "").isalpha()) for t in tokens):
+
+        # Check if tokens look like last names
+        def _looks_like_lastname(t: str) -> bool:
+            n = _normalize_token(t)
+            return (f"lnk_{_surname_key(n)}" in patients) or any(
+                (k.endswith(f"_{n}")) for k in patients.keys()
+                if not k.startswith(("prn_", "lnk_"))
+            )
+
+        lname_hits = sum(_looks_like_lastname(t) for t in tokens)
+
+        # If 3+ look like last names, treat as list of last names
+        if lname_hits >= max(3, len(tokens)):
+            return [(t, metadata) for t in tokens]
+
+        # Otherwise, if even count, pair as Last, First
+        if len(tokens) % 2 == 0:
+            out = []
+            for i in range(0, len(tokens), 2):
+                out.append((f"{tokens[i]}, {tokens[i+1]}", metadata))
+            return out
+
+    # Handle each segment independently
+    out = []
+    for seg in tokens:
+        seg = seg.strip()
+        if not seg:
+            continue
+        words = [w for w in seg.split() if w.isalpha()]
+        if len(words) == 2:
+            f1, f2 = words
+            cand1 = f"{f2}, {f1}"
+            cand2 = f"{f1}, {f2}"
+            k1 = f"lnk_{_surname_key(f2)}"
+            k2 = f"lnk_{_surname_key(f1)}"
+            if k1 in patients:
+                out.append((cand1, metadata))
+            elif k2 in patients:
+                out.append((cand2, metadata))
+            else:
+                out.append((cand1, metadata))
+        elif len(words) == 3:
+            ln, f1, f2 = words[0], words[1], words[2]
+            out.append((f"{ln}, {f1}", metadata))
+            out.append((f"{ln}, {f2}", metadata))
         else:
-            return None
-    
-    input_last_norm = _normalize_token(input_last)
-    input_first_norm = _normalize_token(input_first)
-    input_surname_key = _surname_key(input_last)
-    
-    best_match = None
-    best_score = 0.0
-    candidates = []
-    
-    for patient_key, patient in patients.items():
-        patient_last_norm = _normalize_token(patient.last_name)
-        patient_first_norm = _normalize_token(patient.first_name)
-        patient_surname_key = _surname_key(patient.last_name)
-        
-        # Calculate last name similarity
-        if input_surname_key == patient_surname_key:
-            last_score = 1.0
-        else:
-            last_score = SequenceMatcher(None, input_last_norm, patient_last_norm).ratio()
-        
-        # Calculate first name similarity
-        if not input_first_norm or not patient_first_norm:
-            first_score = 0.5 if not input_first_norm else 0.0
-        elif input_first_norm == patient_first_norm:
-            first_score = 1.0
-        elif input_first_norm[0] == patient_first_norm[0]:
-            first_score = 0.7
-        else:
-            first_score = SequenceMatcher(None, input_first_norm, patient_first_norm).ratio()
-        
-        # Combined score (weighted: last name more important)
-        combined_score = (last_score * 0.7) + (first_score * 0.3)
-        
-        if combined_score >= threshold:
-            candidates.append((patient, combined_score))
-            if combined_score > best_score:
-                best_score = combined_score
-                best_match = patient
-    
-    if best_match:
-        # Check for ambiguous matches
-        is_ambiguous = len([c for c in candidates if abs(c[1] - best_score) < 0.05]) > 1
-        return (best_match, best_score, is_ambiguous)
-    
-    return None
+            norm = normalize_name_format(seg)
+            if norm and "," in norm:
+                out.append((norm, metadata))
+            else:
+                out.append((seg, metadata))
+    return out
 
 def process_appointments_with_patients(appointments: List[Dict], 
                                       patients: Dict[str, PatientData]) -> Tuple[List[Dict], List[Dict], Dict]:
     """Process appointments and match with patient records"""
-    
     matched = []
     unmatched = []
+    
     stats = {
         'total_appointments': len(appointments),
         'total_names_extracted': 0,
         'matched_patients': 0,
         'unmatched_entries': 0,
-        'split_entries': 0,
-        'metadata_extracted': 0,
         'fuzzy_matches': 0,
         'ambiguous_matches': 0,
+        'split_entries': 0,
+        'metadata_extracted': 0,
         'rejected_low_confidence': 0
     }
     
+    MIN_CONFIDENCE = 0.75
+    
     for apt in appointments:
         original_title = apt['title'].strip()
+        names_with_metadata = split_combined_names(original_title, patients)
         
-        if not original_title or original_title == "No Title":
+        # De-dup names per appointment
+        seen = set()
+        deduped = []
+        for nm, md in names_with_metadata:
+            fn, ln = parse_patient_name(nm)
+            key = f"{_normalize_token(ln)},{_normalize_token(fn)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((nm, md))
+        names_with_metadata = deduped
+
+        # If no valid names extracted
+        if not names_with_metadata:
+            unmatched_entry = {
+                'original_name': original_title,
+                'date': apt['start_date'],
+                'start_time': apt['start_time'],
+                'end_time': apt['end_time'],
+                'day_of_week': apt['day_of_week'],
+                'full_title': original_title,
+                'codes': ''
+            }
+            unmatched.append(unmatched_entry)
             continue
         
-        names_and_codes = extract_name_and_codes(original_title)
-        stats['total_names_extracted'] += len(names_and_codes)
+        stats['total_names_extracted'] += len(names_with_metadata)
         
-        if len(names_and_codes) > 1:
+        if len(names_with_metadata) > 1:
             stats['split_entries'] += 1
         
-        for name, metadata in names_and_codes:
+        seen_patients = set()
+
+        for name_tuple in names_with_metadata:
+            name, metadata = name_tuple
+            
             if metadata:
                 stats['metadata_extracted'] += 1
             
-            match_result = find_best_patient_match(name, patients)
+            patient, is_ambiguous, confidence = match_patient(name, patients)
             
-            if match_result:
-                patient, confidence, is_ambiguous = match_result
-                
-                if confidence < 0.75:
-                    stats['rejected_low_confidence'] += 1
-                    unmatched_entry = {
-                        'original_name': name,
-                        'date': apt['start_date'],
-                        'start_time': apt['start_time'],
-                        'end_time': apt['end_time'],
-                        'day_of_week': apt['day_of_week'],
-                        'full_title': original_title,
-                        'codes': metadata
-                    }
-                    unmatched.append(unmatched_entry)
-                    stats['unmatched_entries'] += 1
+            # Reject matches below minimum confidence
+            if patient and confidence < MIN_CONFIDENCE:
+                patient = None
+                stats['rejected_low_confidence'] += 1
+            
+            if patient:
+                # De-dup by normalized full name
+                pid = f"{_normalize_token(patient.last_name)},{_normalize_token(patient.first_name)}"
+                if pid in seen_patients:
                     continue
+                seen_patients.add(pid)
                 
                 matched_entry = {
                     'name': patient.full_name(),
@@ -422,7 +667,7 @@ def process_appointments_with_patients(appointments: List[Dict],
                     'doctor': patient.doctor,
                     'codes': metadata,
                     'original_title': original_title,
-                    'confidence': f"{confidence*100:.1f}%"
+                    'confidence': f"{confidence:.1%}"
                 }
                 matched.append(matched_entry)
                 stats['matched_patients'] += 1
@@ -573,7 +818,7 @@ def create_zip_file(files_dict: Dict[str, bytes]) -> bytes:
 # Main Streamlit App
 def main():
     st.title("📅 iCalendar Appointment Processor")
-    st.markdown("Extract and process Monday/Friday appointments with patient matching")
+    st.markdown("Extract and process Monday/Friday appointments with advanced patient matching")
     
     # Sidebar for configuration
     with st.sidebar:
@@ -606,7 +851,7 @@ def main():
         selected_months = [month_options[month] for month in selected_month_names]
         
         st.markdown("---")
-        st.info("📌 This app extracts Monday and Friday appointments from your calendar and matches them with patient records.")
+        st.info("📌 This app uses advanced fuzzy matching with Armenian/Slavic name harmonization to match appointments with patient records.")
     
     # Main content area
     col1, col2 = st.columns(2)
@@ -625,7 +870,7 @@ def main():
         patient_file = st.file_uploader(
             "Upload Patient List (list_of_patients_mutual.xlsx)",
             type=['xlsx', 'xls'],
-            help="Upload the Excel file containing patient information"
+            help="Upload the Excel file with columns: Name, PRN, Insurance, (empty), Doctor"
         )
     
     with col2:
@@ -633,6 +878,7 @@ def main():
         st.write(f"**Year:** {year}")
         st.write(f"**Months:** {', '.join(selected_month_names)}")
         st.write(f"**Days:** Monday and Friday only")
+        st.write(f"**Matching Threshold:** 75% minimum confidence")
     
     # Process button
     if st.button("🚀 Process Appointments", type="primary", use_container_width=True):
@@ -663,10 +909,11 @@ def main():
                     # Step 3: Load patient list
                     log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Loading patient list...")
                     patients = load_patient_list(patient_file.read())
-                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Loaded {len(patients)} patient records")
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Loaded {len([p for p in patients.values() if isinstance(p, PatientData)])} patient records")
                     
                     # Step 4: Process and match
                     log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing appointments and matching patients...")
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Using advanced fuzzy matching with surname harmonization...")
                     matched, unmatched, stats = process_appointments_with_patients(appointments, patients)
                     log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Processing complete: {stats['matched_patients']} matched, {stats['unmatched_entries']} unmatched")
                     
@@ -718,6 +965,15 @@ def main():
                          st.session_state.stats['total_names_extracted'] * 100 
                          if st.session_state.stats['total_names_extracted'] > 0 else 0)
             st.metric("Match Rate", f"{match_rate:.1f}%")
+        
+        # Additional statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Fuzzy Matches", st.session_state.stats['fuzzy_matches'])
+        with col2:
+            st.metric("Split Entries", st.session_state.stats['split_entries'])
+        with col3:
+            st.metric("Low Confidence Rejected", st.session_state.stats.get('rejected_low_confidence', 0))
         
         # Display summary report
         with st.expander("📋 View Summary Report"):
