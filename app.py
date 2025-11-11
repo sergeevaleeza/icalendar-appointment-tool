@@ -23,13 +23,15 @@ import os
 
 # Configure page
 st.set_page_config(
-    page_title="iCalendar Appointment Processor",
+    page_title="iCalendar Appointment Tool",
     page_icon="📅",
     layout="wide"
 )
 
 # Setup logging for the app
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Initialize session state for storing results
@@ -103,16 +105,27 @@ def parse_ical_file(ical_content: bytes) -> Calendar:
     except Exception as e:
         raise Exception(f"Error parsing iCalendar file: {str(e)}")
 
-def is_monday_or_friday(dt: datetime) -> bool:
-    """Check if the datetime falls on Monday (0) or Friday (4)"""
-    return dt.weekday() in [0, 4]
+def is_target_day(dt: datetime, target_days: List[int]) -> bool:
+    """Check if the datetime falls on one of the target days
+    Days: Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6"""
+    return dt.weekday() in target_days
 
 def is_in_target_months(dt: datetime, target_months: List[int], target_year: int) -> bool:
     """Check if the datetime is in the target months and year"""
     return dt.year == target_year and dt.month in target_months
 
-def extract_appointments(calendar: Calendar, months: List[int], year: int) -> List[Dict]:
-    """Extract appointments that fall on Monday/Friday in specified months"""
+def extract_appointments(calendar: Calendar, months: List[int], year: int, days: List[int] = None) -> List[Dict]:
+    """Extract appointments that fall on specified days in specified months
+    
+    Args:
+        calendar: iCalendar object
+        months: List of months (1-12)
+        year: Target year
+        days: List of weekdays (0=Monday, 6=Sunday). Default is Monday and Friday.
+    """
+    if days is None:
+        days = [0, 4]  # Default to Monday and Friday
+    
     appointments = []
     
     for component in calendar.walk():
@@ -161,7 +174,7 @@ def extract_appointments(calendar: Calendar, months: List[int], year: int) -> Li
                     end_of_year = datetime(year + 1, 1, 1, tzinfo=pytz.UTC)
                     
                     for occurrence in rule.between(start_of_year, end_of_year, inc=True):
-                        if is_monday_or_friday(occurrence) and is_in_target_months(occurrence, months, year):
+                        if is_target_day(occurrence, days) and is_in_target_months(occurrence, months, year):
                             duration = end_datetime - event_datetime
                             occurrence_end = occurrence + duration
                             
@@ -177,7 +190,7 @@ def extract_appointments(calendar: Calendar, months: List[int], year: int) -> Li
                 except Exception as e:
                     logger.warning(f"Could not process recurring event '{summary}': {str(e)}")
             else:
-                if is_monday_or_friday(event_datetime) and is_in_target_months(event_datetime, months, year):
+                if is_target_day(event_datetime, days) and is_in_target_months(event_datetime, months, year):
                     appointments.append({
                         'title': summary,
                         'start_date': event_datetime.strftime('%m/%d/%Y'),
@@ -189,6 +202,7 @@ def extract_appointments(calendar: Calendar, months: List[int], year: int) -> Li
                     })
     
     appointments.sort(key=lambda x: (datetime.strptime(x['start_date'], '%m/%d/%Y'), x['start_time']))
+    logger.info(f"Extracted {len(appointments)} appointments")
     return appointments
 
 def parse_patient_name(name: str) -> Tuple[str, str]:
@@ -221,6 +235,7 @@ def load_patient_list(excel_content: bytes) -> Dict[str, PatientData]:
     """Load patient list from Excel file with enhanced indexing"""
     try:
         df = pd.read_excel(io.BytesIO(excel_content), header=None)
+        logger.info(f"Loaded patient list with {len(df)} records")
         patients: Dict[str, PatientData] = {}
 
         for _, row in df.iterrows():
@@ -238,6 +253,7 @@ def load_patient_list(excel_content: bytes) -> Dict[str, PatientData]:
 
             # build the patient object
             patient = PatientData(first_name, last_name, prn, insurance, doctor)
+            logger.info(f"Loaded patient: {patient.full_name()} (PRN: {prn}, Insurance: {insurance}, Doctor: {doctor})")
 
             # Enhanced indexing for better matching
             first_key = _normalize_token(first_name)
@@ -278,12 +294,12 @@ def match_patient_by_lastname_only(candidate_last: str,
 
     patient_to_score: Dict[PatientData, float] = {}
 
-    # Fast path from surname bucket
+    # Fast path from surname bucket (start with 0.95)
     bucket = patients.get(f"lnk_{cand_key}", [])
     for p in bucket:
         patient_to_score[p] = max(patient_to_score.get(p, 0), 0.95)
 
-    # Fuzzy sweep over real PatientData entries
+    # Fuzzy sweep over real PatientData entries, update max score per patient
     for key, p in patients.items():
         if key.startswith(("prn_", "lnk_")): 
             continue
@@ -312,6 +328,7 @@ def match_patient_by_lastname_only(candidate_last: str,
 
     # Sort by score desc
     hits = sorted(patient_to_score.items(), key=lambda x: x[1], reverse=True)[:max_results]
+    logger.info(f"Lastname-only hits for '{candidate_last}': {[(h[0].full_name(), h[1]) for h in hits]}")
     return hits
 
 def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional[PatientData], bool, float]:
@@ -326,11 +343,13 @@ def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional
         # Exact by display key
         disp_key = f"display_{last_lower}, {first_lower}"
         if disp_key in patients and isinstance(patients[disp_key], PatientData):
+            logger.info(f"Exact display match for '{name}' -> '{patients[disp_key].full_name()}'")
             return patients[disp_key], False, 1.0
 
         # Exact by canonical key
         name_key = f"{first_lower}_{last_lower}"
         if name_key in patients and isinstance(patients[name_key], PatientData):
+            logger.info(f"Exact canonical match for '{name}' -> '{patients[name_key].full_name()}'")
             return patients[name_key], False, 1.0
 
     # Fuzzy matching
@@ -385,10 +404,14 @@ def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional
             (last_name_score >= 0.90 and first_name_score >= 0.50):
             overall_score = (first_name_score + last_name_score) / 2
             matches.append((patient, overall_score, first_name_score, last_name_score))
-    
+            if overall_score >= 0.80:
+                logger.info(f"High fuzzy score for '{name}' -> '{patient.full_name()}' (Overall: {overall_score:.1%}, First: {first_name_score:.1%}, Last: {last_name_score:.1%})")
+
     if matches:
         matches.sort(key=lambda x: x[1], reverse=True)
         best_match = matches[0]
+        logger.info(f"Fuzzy match: '{name}' -> '{best_match[0].full_name()}' "
+                   f"(Overall: {best_match[1]:.1%}, First: {best_match[2]:.1%}, Last: {best_match[3]:.1%})")
         is_ambiguous = len([m for m in matches if m[1] >= 0.85]) > 1
         return best_match[0], is_ambiguous, best_match[1]
     
@@ -400,6 +423,7 @@ def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional
             ln_matches = match_patient_by_lastname_only(cand_ln, patients)
             if ln_matches:
                 top = ln_matches[0]
+                logger.info(f"Lastname-only bucket hit: '{name}' -> '{top[0].full_name()}' ({top[1]:.1%})")
                 return top[0], False, max(0.90, top[1])
 
     # Fallback: lastname-only when no full name
@@ -412,7 +436,8 @@ def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional
                 if len(ln_matches) > 1:
                     diff = top[1] - ln_matches[1][1]
                     is_ambiguous = diff < 0.10
-                return top[0], is_ambiguous, top[1]
+                    logger.info(f"Lastname-only fuzzy: '{name}' -> '{top[0].full_name()}' ({top[1]:.1%}) ambiguous={is_ambiguous}")
+                    return top[0], is_ambiguous, top[1]
     
     # Last-resort: exact display equality
     display_key = f"{_normalize_token(last_name)}, {_normalize_token(first_name)}"
@@ -421,8 +446,10 @@ def match_patient(name: str, patients: Dict[str, PatientData]) -> Tuple[Optional
             continue
         disp = f"{_normalize_token(p.last_name)}, {_normalize_token(p.first_name)}"
         if disp == display_key:
+            logger.info(f"Last-resort exact display match for '{name}' -> '{p.full_name()}'")
             return p, False, 1.0
 
+    logger.warning(f"No patient match found for: {name}")
     return None, False, 0.0
 
 def extract_metadata(title: str) -> Tuple[str, str]:
@@ -451,19 +478,33 @@ def extract_metadata(title: str) -> Tuple[str, str]:
 def normalize_name_format(name: str) -> str:
     """Convert 'FirstName LastName' to 'LastName, FirstName' format"""
     name = name.strip()
-    
+
+    # Already in "Last, First" format
     if ',' in name:
         return name
     
-    parts = [p for p in name.split() if p]
+    # Split by whitespace
+    parts = [p for p in name.split() if p] # Remove empty strings
     
     if len(parts) == 0:
         return name
     elif len(parts) == 1:
+        # Single name - assume it's last name
         return name
     elif len(parts) == 2:
+        # "First Last" → "Last, First"
+        # OR "Initial Last"
         return f"{parts[1]}, {parts[0]}"
+    elif len(parts) == 3:
+        # Could be:
+        # "First Middle Last" → "Last, First Middle"
+        # "First Last1 Last2" → "Last1 Last2, First"
+        # Heuristic: Use last word as last name, rest as first names
+        last_name = parts[-1]
+        first_names = ' '.join(parts[:-1])
+        return f"{last_name}, {first_names}"
     else:
+        # Multiple parts - assume last word is last name
         last_name = parts[-1]
         first_names = ' '.join(parts[:-1])
         return f"{last_name}, {first_names}"
@@ -471,7 +512,14 @@ def normalize_name_format(name: str) -> str:
 def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[Tuple[str, str]]:
     """
     Return [(normalized_name, metadata)] from a raw appointment title.
-    Handles multiple name formats and splits multiple patients.
+    Handles:
+      - "First Last, First Last" (two full people)
+      - "Last First, First" (one last with two firsts)
+      - "Last, First First" (after normalize_name_format)
+      - "Last1, Last2, Last3, Last4" (all bare last names)
+      - "A and B" form for last names
+      - "Last First First" (same last, 2 given names)
+      - noise like '13/36', 'TMS #29', diagnoses -> stripped
     """
     clean_title, metadata = extract_metadata(title)
     clean_title = _clean_person_token(clean_title)
@@ -484,13 +532,14 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
         if len(parts) == 2 and all(" " not in p for p in parts):
             return [(p, metadata) for p in parts]
 
-    # Comma-based split first
+    # Comma-based split first (it’s most informative)
     parts = [p.strip() for p in clean_title.split(",") if p.strip()]
     if len(parts) == 0:
         return []
     if len(parts) == 1:
-        # Single segment -> normalize
+        # Single segment -> normalize to "Last, First First..."
         normalized = normalize_name_format(parts[0])
+        # If it's "LN FN FN" and LN exists in patients, split as two under same last
         words = parts[0].split()
         if len(words) == 3:
             ln, f1, f2 = words[0], words[1], words[2]
@@ -499,7 +548,7 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
 
         if normalized and "," in normalized:
             last, firsts = [p.strip() for p in normalized.split(",", 1)]
-            # Expand multi-firsts
+            # Expand multi-firsts (e.g., "Larisa Igor" => two rows)
             first_parts = [f for f in firsts.split() if f.isalpha() and len(f) > 1]
             if len(first_parts) > 1:
                 for fp in first_parts:
@@ -507,6 +556,7 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
                 return names
             if firsts:
                 return [(f"{last}, {firsts}", metadata)]
+        # Couldn’t normalize; fall back as-is
         return [(parts[0], metadata)]
     
     # Special-case: "Last First, First" -> same last, two people
@@ -516,6 +566,7 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             last_candidate, first0 = seg0_words[0].strip(), seg0_words[1].strip()
             if f"lnk_{_surname_key(last_candidate)}" in patients:
                 out = [(f"{last_candidate}, {first0}", metadata)]
+                # split any additional first names in subsequent segments
                 for j in range(1, len(parts)):
                     for fn in parts[j].split():
                         fn = _clean_person_token(fn)
@@ -525,9 +576,10 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
 
     # Check if all tokens are single words
     tokens = [_clean_person_token(p) for p in parts if p]
+    # All tokens are single alphabetic words
     if all((" " not in t and t.replace("-", "").replace("'", "").isalpha()) for t in tokens):
 
-        # Check if tokens look like last names
+        # First: do a surname check BEFORE pairing
         def _looks_like_lastname(t: str) -> bool:
             n = _normalize_token(t)
             return (f"lnk_{_surname_key(n)}" in patients) or any(
@@ -541,11 +593,24 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
         if lname_hits >= max(3, len(tokens)):
             return [(t, metadata) for t in tokens]
 
-        # Otherwise, if even count, pair as Last, First
+        # Otherwise, if even count, fall back to alternating Last, First pairing
         if len(tokens) % 2 == 0:
             out = []
             for i in range(0, len(tokens), 2):
                 out.append((f"{tokens[i]}, {tokens[i+1]}", metadata))
+            return out
+    
+    # Detect “Last, First [First...]” (same last name, multiple firsts)
+    first_part = tokens[0]
+    if " " not in first_part and len(tokens) >= 2:
+        last = first_part
+        out = []
+        for i in range(1, len(tokens)):
+            for fn in tokens[i].split():
+                fn = _clean_person_token(fn)
+                if fn.isalpha() and len(fn) > 1:
+                    out.append((f"{last}, {fn}", metadata))
+        if out:
             return out
 
     # Handle each segment independently
@@ -556,9 +621,11 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             continue
         words = [w for w in seg.split() if w.isalpha()]
         if len(words) == 2:
+            # Try "First Last" then "Last First"
             f1, f2 = words
             cand1 = f"{f2}, {f1}"
             cand2 = f"{f1}, {f2}"
+            # Pick the one whose last name exists in patients (surname key)
             k1 = f"lnk_{_surname_key(f2)}"
             k2 = f"lnk_{_surname_key(f1)}"
             if k1 in patients:
@@ -566,12 +633,14 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             elif k2 in patients:
                 out.append((cand2, metadata))
             else:
-                out.append((cand1, metadata))
+                out.append((cand1, metadata)) # default
         elif len(words) == 3:
+            # Likely "Last First First"
             ln, f1, f2 = words[0], words[1], words[2]
             out.append((f"{ln}, {f1}", metadata))
             out.append((f"{ln}, {f2}", metadata))
         else:
+            # Fallback: try normalize_name_format (may produce "Last, First First...")
             norm = normalize_name_format(seg)
             if norm and "," in norm:
                 out.append((norm, metadata))
@@ -581,7 +650,10 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
 
 def process_appointments_with_patients(appointments: List[Dict], 
                                       patients: Dict[str, PatientData]) -> Tuple[List[Dict], List[Dict], Dict]:
-    """Process appointments and match with patient records"""
+    """
+    Process appointments and match with patient records
+    Returns: (matched_appointments, unmatched_appointments, summary_stats)
+    """
     matched = []
     unmatched = []
     
@@ -597,13 +669,15 @@ def process_appointments_with_patients(appointments: List[Dict],
         'rejected_low_confidence': 0
     }
     
+    # Minimum confidence threshold
     MIN_CONFIDENCE = 0.75
     
     for apt in appointments:
+        # Strip the title and use that as the canonical original_title
         original_title = apt['title'].strip()
         names_with_metadata = split_combined_names(original_title, patients)
         
-        # De-dup names per appointment
+        # --- De-dup names per appointment (by normalized "last,first") ---
         seen = set()
         deduped = []
         for nm, md in names_with_metadata:
@@ -615,8 +689,9 @@ def process_appointments_with_patients(appointments: List[Dict],
             deduped.append((nm, md))
         names_with_metadata = deduped
 
-        # If no valid names extracted
+        # If no valid names extracted, add to unmatched for review
         if not names_with_metadata:
+            # These are skipped entries (Michigan, Oregon, etc.) or parsing failures
             unmatched_entry = {
                 'original_name': original_title,
                 'date': apt['start_date'],
@@ -633,10 +708,13 @@ def process_appointments_with_patients(appointments: List[Dict],
         
         if len(names_with_metadata) > 1:
             stats['split_entries'] += 1
+            logger.info(f"Split '{original_title}' into {len(names_with_metadata)} names")
         
-        seen_patients = set()
+        # After names_with_metadata = deduped
+        seen_patients = set() # de-dup AFTER matching by PRN or normalized full name
 
         for name_tuple in names_with_metadata:
+            # Unpack the tuple - name_tuple is (name, metadata)
             name, metadata = name_tuple
             
             if metadata:
@@ -644,18 +722,20 @@ def process_appointments_with_patients(appointments: List[Dict],
             
             patient, is_ambiguous, confidence = match_patient(name, patients)
             
-            # Reject matches below minimum confidence
+            # CRITICAL: Reject matches below minimum confidence threshold
             if patient and confidence < MIN_CONFIDENCE:
                 patient = None
                 stats['rejected_low_confidence'] += 1
             
             if patient:
-                # De-dup by normalized full name
+                # Always use normalized full name for de-dup to avoid skipping different patients with same PRN
                 pid = f"{_normalize_token(patient.last_name)},{_normalize_token(patient.first_name)}"
+                logger.info(f"Computed PID for '{patient.full_name()}' (from '{name}'): {pid} (PRN was '{patient.prn}')")
                 if pid in seen_patients:
-                    continue
+                    logger.warning(f"Skipping duplicate PID {pid} for name '{name}' matched to '{patient.full_name()}'")
+                    continue  # skip duplicate patient within this appointment
                 seen_patients.add(pid)
-                
+                logger.info(f"Appending matched entry for name '{name}' matched to '{patient.full_name()}'")
                 matched_entry = {
                     'name': patient.full_name(),
                     'date': apt['start_date'],
@@ -665,8 +745,8 @@ def process_appointments_with_patients(appointments: List[Dict],
                     'prn': patient.prn,
                     'insurance': patient.insurance,
                     'doctor': patient.doctor,
-                    'codes': metadata,
-                    'original_title': original_title,
+                    'codes': metadata,  # CPT codes and TMS session info
+                    'original_title': original_title,  # Use stripped version
                     'confidence': f"{confidence:.1%}"
                 }
                 matched.append(matched_entry)
@@ -683,7 +763,7 @@ def process_appointments_with_patients(appointments: List[Dict],
                     'start_time': apt['start_time'],
                     'end_time': apt['end_time'],
                     'day_of_week': apt['day_of_week'],
-                    'full_title': original_title,
+                    'full_title': original_title, # Use stripped version
                     'codes': metadata
                 }
                 unmatched.append(unmatched_entry)
@@ -696,6 +776,7 @@ def create_csv_content(matched: List[Dict]) -> str:
     output = io.StringIO()
     
     if not matched:
+        logger.warning("No matched appointments to write")
         return ""
     
     fieldnames = ['name', 'date', 'start_time', 'end_time', 'day_of_week', 
@@ -704,17 +785,21 @@ def create_csv_content(matched: List[Dict]) -> str:
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(matched)
-    
+
+    logger.info(f"Successfully wrote {len(matched)} matched appointments to {output}")
+
     return output.getvalue()
 
 def create_excel_content(unmatched: List[Dict]) -> bytes:
     """Create Excel content from unmatched entries"""
     if not unmatched:
+        logger.info("No unmatched entries to write")
         return b""
     
     df = pd.DataFrame(unmatched)
     output = io.BytesIO()
     df.to_excel(output, index=False, sheet_name='Unmatched')
+    logger.info(f"Successfully wrote {len(unmatched)} unmatched entries to {output}")
     return output.getvalue()
 
 def _c(x): 
@@ -794,7 +879,8 @@ def generate_summary_report(stats: Dict, matched: List[Dict]) -> str:
         report_lines.append("")
     
     report_lines.append("=" * 60)
-    
+
+    logger.info(f"Summary report written to {report_lines}")
     return "\n".join(report_lines)
 
 def create_log_content(log_messages: List[str]) -> str:
@@ -803,6 +889,7 @@ def create_log_content(log_messages: List[str]) -> str:
     log_content = f"Processing Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     log_content += "=" * 60 + "\n\n"
     log_content += "\n".join(log_messages)
+    logger.info(f"Log of this run is written to {log_content}")
     return log_content
 
 def create_zip_file(files_dict: Dict[str, bytes]) -> bytes:
@@ -812,13 +899,13 @@ def create_zip_file(files_dict: Dict[str, bytes]) -> bytes:
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for filename, content in files_dict.items():
             zip_file.writestr(filename, content)
-    
+    logger.info(f"All files are zipped into this file: {zip_buffer}")
     return zip_buffer.getvalue()
 
 # Main Streamlit App
 def main():
-    st.title("📅 iCalendar Appointment Processor")
-    st.markdown("Extract and process Monday/Friday appointments with advanced patient matching")
+    st.title("📅 iCalendar Appointment Tool")
+    st.markdown("Extract and process appointments with advanced patient matching")
     
     # Sidebar for configuration
     with st.sidebar:
@@ -850,8 +937,57 @@ def main():
         
         selected_months = [month_options[month] for month in selected_month_names]
         
+        # Day selection
+        st.markdown("### Select Days of Week")
+        
+        # Quick select buttons
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        with col1:
+            if st.button("All Days", use_container_width=True):
+                st.session_state.selected_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        with col2:
+            if st.button("Weekdays", use_container_width=True):
+                st.session_state.selected_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        with col3:
+            if st.button("Weekends", use_container_width=True):
+                st.session_state.selected_days = ["Saturday", "Sunday"]
+        with col4:
+            if st.button("M/F", use_container_width=True):
+                st.session_state.selected_days = ["Monday", "Friday"]
+        with col5:
+            if st.button("M/W/F", use_container_width=True):
+                st.session_state.selected_days = ["Monday", "Wednesday", "Friday"]
+        with col6:
+            if st.button("T/Th", use_container_width=True):
+                st.session_state.selected_days = ["Tuesday", "Thursday"]
+        
+        
+        day_options = {
+            "Monday": 0,
+            "Tuesday": 1,
+            "Wednesday": 2,
+            "Thursday": 3,
+            "Friday": 4,
+            "Saturday": 5,
+            "Sunday": 6
+        }
+        
+        # Initialize session state for days if not exists
+        if 'selected_days' not in st.session_state:
+            st.session_state.selected_days = ["Monday", "Friday"]
+        
+        selected_day_names = st.multiselect(
+            "Select Days",
+            options=list(day_options.keys()),
+            default=st.session_state.selected_days if 'selected_days' in st.session_state else ["Monday", "Friday"],
+            key="day_selector",
+            help="Select which days of the week to extract appointments from"
+        )
+        
+        selected_days = [day_options[day] for day in selected_day_names]
+        
         st.markdown("---")
-        st.info("📌 This app uses advanced fuzzy matching with Armenian/Slavic name harmonization to match appointments with patient records.")
+        st.info("📌 Select any days of the week to extract appointments. The app uses advanced fuzzy matching with Armenian/Slavic name harmonization to match appointments with patient records.")
     
     # Main content area
     col1, col2 = st.columns(2)
@@ -870,14 +1006,14 @@ def main():
         patient_file = st.file_uploader(
             "Upload Patient List (list_of_patients_mutual.xlsx)",
             type=['xlsx', 'xls'],
-            help="Upload the Excel file with columns: Name, PRN, Insurance, (empty), Doctor"
+            help="Upload the Excel file without a header with columns: [LastName, FirstName], [Diagnosis Codes], [Insurance], [Secondary Insurance], [Doctor], [Notes]"
         )
     
     with col2:
         st.header("📊 Selected Parameters")
         st.write(f"**Year:** {year}")
         st.write(f"**Months:** {', '.join(selected_month_names)}")
-        st.write(f"**Days:** Monday and Friday only")
+        st.write(f"**Days:** {', '.join(selected_day_names)}")
         st.write(f"**Matching Threshold:** 75% minimum confidence")
     
     # Process button
@@ -888,6 +1024,8 @@ def main():
             st.error("Please upload the patient list Excel file")
         elif not selected_months:
             st.error("Please select at least one month")
+        elif not selected_days:
+            st.error("Please select at least one day of the week")
         else:
             with st.spinner("Processing appointments..."):
                 log_messages = []
@@ -898,8 +1036,8 @@ def main():
                     log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Successfully parsed iCalendar file")
                     
                     # Step 2: Extract appointments
-                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Extracting Monday/Friday appointments for {', '.join(selected_month_names)} {year}")
-                    appointments = extract_appointments(calendar, selected_months, year)
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Extracting {', '.join(selected_day_names)} appointments for {', '.join(selected_month_names)} {year}")
+                    appointments = extract_appointments(calendar, selected_months, year, selected_days)
                     log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Extracted {len(appointments)} appointments")
                     
                     if not appointments:
