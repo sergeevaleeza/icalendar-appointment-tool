@@ -1,0 +1,12 @@
+# Core dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+icalendar>=5.0.0
+pytz>=2023.3
+python-dateutil>=2.8.2
+
+# Excel support
+openpyxl>=3.1.0
+
+# Additional requirements for processing
+unicodedata2>=15.1.0
