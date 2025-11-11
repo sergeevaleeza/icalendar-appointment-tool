@@ -937,29 +937,29 @@ def main():
         
         selected_months = [month_options[month] for month in selected_month_names]
         
-        # Day selection
+# Day selection
         st.markdown("### Select Days of Week")
         
         # Quick select buttons
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             if st.button("All Days", use_container_width=True):
-                st.session_state.selected_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                st.session_state["day_selector"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         with col2:
             if st.button("Weekdays", use_container_width=True):
-                st.session_state.selected_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                st.session_state["day_selector"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
         with col3:
             if st.button("Weekends", use_container_width=True):
-                st.session_state.selected_days = ["Saturday", "Sunday"]
+                st.session_state["day_selector"] = ["Saturday", "Sunday"]
         with col4:
             if st.button("M/F", use_container_width=True):
-                st.session_state.selected_days = ["Monday", "Friday"]
+                st.session_state["day_selector"] = ["Monday", "Friday"]
         with col5:
             if st.button("M/W/F", use_container_width=True):
-                st.session_state.selected_days = ["Monday", "Wednesday", "Friday"]
+                st.session_state["day_selector"] = ["Monday", "Wednesday", "Friday"]
         with col6:
             if st.button("T/Th", use_container_width=True):
-                st.session_state.selected_days = ["Tuesday", "Thursday"]
+                st.session_state["day_selector"] = ["Tuesday", "Thursday"]
         
         
         day_options = {
@@ -972,14 +972,10 @@ def main():
             "Sunday": 6
         }
         
-        # Initialize session state for days if not exists
-        if 'selected_days' not in st.session_state:
-            st.session_state.selected_days = ["Monday", "Friday"]
-        
         selected_day_names = st.multiselect(
             "Select Days",
             options=list(day_options.keys()),
-            default=st.session_state.selected_days if 'selected_days' in st.session_state else ["Monday", "Friday"],
+            default=["Monday", "Friday"],
             key="day_selector",
             help="Select which days of the week to extract appointments from"
         )
