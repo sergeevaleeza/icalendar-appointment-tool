@@ -1,14 +1,12 @@
 # iCalendar Appointment Processor
 
-A Streamlit web application for processing iCalendar appointments and matching them with patient records.
+This is a Streamlit app that extracts appointments from an iCalendar file, matches them with a patient list from an Excel file, and generates output files including matched appointments, unmatched entries, and a summary report. The app allows configuration of the year, months, and days to extract appointments for.
 
 ## Features
-
-- **Calendar Processing**: Extracts Monday and Friday appointments from iCalendar files
-- **Month Selection**: Choose specific months to process
-- **Patient Matching**: Intelligent fuzzy matching algorithm to match appointment names with patient records
-- **Multiple Output Files**: Generates matched appointments CSV, unmatched entries Excel, summary report, and processing log
-- **Zip Download**: Download all generated files in a single zip archive
+- Upload iCalendar (.ics) file and patient list (.xlsx).
+- Select year, months, and days via sidebar.
+- Process data and generate output files.
+- Download results as a ZIP file, including a date-based log file.
 
 ## Deployment on Streamlit Cloud
 
@@ -62,16 +60,15 @@ The app will open in your browser at `http://localhost:8501`
 
 ## Usage
 
-1. **Select Year and Months**: Use the sidebar to configure which year and months to process
+1. **Select Year, Months and Days**: Use the sidebar to configure which year, months and days to process
 
 2. **Upload Files**:
    - **iCalendar File**: Upload your `.ics` calendar file
    - **Patient List**: Upload the `list_of_patients_mutual.xlsx` file with columns:
-     - Column A: Last Name
-     - Column B: First Name
-     - Column C: PRN
-     - Column D: Insurance
-     - Column E: Doctor
+      - Column A: Last Name, First Name 
+      - Column B: ICD-10-CM Codes
+      - Column C: Insurance
+      - Column E: Doctor
 
 3. **Process**: Click the "Process Appointments" button
 
@@ -85,17 +82,16 @@ The app will open in your browser at `http://localhost:8501`
 
 ### Input: Patient List Excel
 The Excel file should have no header row and contain:
-- Column A: Last Name
-- Column B: First Name  
-- Column C: PRN (Patient Record Number)
-- Column D: Insurance
+- Column A: Last Name, First Name 
+- Column B: ICD-10-CM Codes
+- Column C: Insurance
 - Column E: Doctor
 
 ### Output: Matched Appointments CSV
 Contains:
 - Patient name (Last, First format)
 - Appointment date, time, day of week
-- PRN, insurance, doctor information
+- ICD-10-CM Codes, insurance, doctor information
 - Procedure codes (CPT/TMS)
 - Match confidence percentage
 
