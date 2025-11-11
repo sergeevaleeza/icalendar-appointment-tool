@@ -1,4 +1,4 @@
-# iCalendar Appointment Processor
+# iCalendar Appointment Tool
 
 This is a Streamlit app that extracts appointments from an iCalendar file, matches them with a patient list from an Excel file, and generates output files including matched appointments, unmatched entries, and a summary report. The app allows configuration of the year, months, and days to extract appointments for.
 
