@@ -57,7 +57,7 @@ def _normalize_token(s: str) -> str:
     s = _WS_RE.sub(" ", s)
     return s
 
-_CLEAN_NOISE_RE = re.compile(r"(?:\bTMS\b|#\d+|\d+/\d+|\bF\d{2}\.\d\b|\b[FR]\d{2}\.\d\b|[()])", re.IGNORECASE)
+_CLEAN_NOISE_RE = re.compile(r"(?:\([^)]*\)|\bTMS\b|#\d+|\d+/\d+|\bF\d{2}\.\d\b|\b[FR]\d{2}\.\d\b)", re.IGNORECASE)
 
 def _clean_person_token(s: str) -> str:
     s = _CLEAN_NOISE_RE.sub(" ", s)
@@ -540,29 +540,61 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
 
     names: List[Tuple[str, str]] = []
 
-    # Split around " and " as a last-name joiner when there's no commas
+    def _normalize_two_word_name(segment: str) -> str:
+        """Given 'First Last' or 'Last First', return 'Last, First' using patient index."""
+        words = segment.split()
+        if len(words) != 2:
+            return normalize_name_format(segment)
+        f1, f2 = words
+        if f"lnk_{_surname_key(f2)}" in patients:
+            return f"{f2}, {f1}"
+        elif f"lnk_{_surname_key(f1)}" in patients:
+            return f"{f1}, {f2}"
+        return f"{f2}, {f1}"  # default: assume "First Last"
+
+    # ✅ FIX 2: Handle "A and B" — now works for multi-word parts too
     if " and " in clean_title and "," not in clean_title:
         parts = [p.strip() for p in clean_title.split(" and ") if p.strip()]
-        if len(parts) == 2 and all(" " not in p for p in parts):
-            return [(p, metadata) for p in parts]
+        if len(parts) == 2:
+            if all(" " not in p for p in parts):
+                # Both single tokens -> two last names
+                return [(p, metadata) for p in parts]
+            else:
+                # Multi-word -> normalize each as a full name
+                result = []
+                for p in parts:
+                    result.append((_normalize_two_word_name(p), metadata))
+                return result
 
-    # Comma-based split first (it’s most informative)
+    # Comma-based split
     parts = [p.strip() for p in clean_title.split(",") if p.strip()]
     if len(parts) == 0:
         return []
+
     if len(parts) == 1:
-        # Single segment -> normalize to "Last, First First..."
-        normalized = normalize_name_format(parts[0])
-        # If it's "LN FN FN" and LN exists in patients, split as two under same last
         words = parts[0].split()
+
+        # ✅ FIX 3: "First Last First Last" (4 words, two full names)
+        if len(words) == 4:
+            k1 = f"lnk_{_surname_key(words[1])}"
+            k2 = f"lnk_{_surname_key(words[3])}"
+            if k1 in patients or k2 in patients:
+                pair1 = f"{words[0]} {words[1]}"
+                pair2 = f"{words[2]} {words[3]}"
+                return [
+                    (_normalize_two_word_name(pair1), metadata),
+                    (_normalize_two_word_name(pair2), metadata),
+                ]
+
+        # Existing: "LN FN FN" (same last, two firsts)
         if len(words) == 3:
             ln, f1, f2 = words[0], words[1], words[2]
             if f"lnk_{_surname_key(ln)}" in patients:
                 return [(f"{ln}, {f1}", metadata), (f"{ln}, {f2}", metadata)]
 
+        normalized = normalize_name_format(parts[0])
         if normalized and "," in normalized:
             last, firsts = [p.strip() for p in normalized.split(",", 1)]
-            # Expand multi-firsts (e.g., "Larisa Igor" => two rows)
             first_parts = [f for f in firsts.split() if f.isalpha() and len(f) > 1]
             if len(first_parts) > 1:
                 for fp in first_parts:
@@ -570,9 +602,8 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
                 return names
             if firsts:
                 return [(f"{last}, {firsts}", metadata)]
-        # Couldn’t normalize; fall back as-is
         return [(parts[0], metadata)]
-    
+
     # Special-case: "Last First, First" -> same last, two people
     if len(parts) >= 2:
         seg0_words = parts[0].split()
@@ -580,7 +611,6 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             last_candidate, first0 = seg0_words[0].strip(), seg0_words[1].strip()
             if f"lnk_{_surname_key(last_candidate)}" in patients:
                 out = [(f"{last_candidate}, {first0}", metadata)]
-                # split any additional first names in subsequent segments
                 for j in range(1, len(parts)):
                     for fn in parts[j].split():
                         fn = _clean_person_token(fn)
@@ -588,12 +618,9 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
                             out.append((f"{last_candidate}, {fn}", metadata))
                 return out
 
-    # Check if all tokens are single words
     tokens = [_clean_person_token(p) for p in parts if p]
-    # All tokens are single alphabetic words
     if all((" " not in t and t.replace("-", "").replace("'", "").isalpha()) for t in tokens):
 
-        # First: do a surname check BEFORE pairing
         def _looks_like_lastname(t: str) -> bool:
             n = _normalize_token(t)
             return (f"lnk_{_surname_key(n)}" in patients) or any(
@@ -602,19 +629,14 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             )
 
         lname_hits = sum(_looks_like_lastname(t) for t in tokens)
-
-        # If 3+ look like last names, treat as list of last names
         if lname_hits >= max(3, len(tokens)):
             return [(t, metadata) for t in tokens]
-
-        # Otherwise, if even count, fall back to alternating Last, First pairing
         if len(tokens) % 2 == 0:
             out = []
             for i in range(0, len(tokens), 2):
                 out.append((f"{tokens[i]}, {tokens[i+1]}", metadata))
             return out
-    
-    # Detect “Last, First [First...]” (same last name, multiple firsts)
+
     first_part = tokens[0]
     if " " not in first_part and len(tokens) >= 2:
         last = first_part
@@ -627,7 +649,6 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
         if out:
             return out
 
-    # Handle each segment independently
     out = []
     for seg in tokens:
         seg = seg.strip()
@@ -635,26 +656,20 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             continue
         words = [w for w in seg.split() if w.isalpha()]
         if len(words) == 2:
-            # Try "First Last" then "Last First"
             f1, f2 = words
-            cand1 = f"{f2}, {f1}"
-            cand2 = f"{f1}, {f2}"
-            # Pick the one whose last name exists in patients (surname key)
             k1 = f"lnk_{_surname_key(f2)}"
             k2 = f"lnk_{_surname_key(f1)}"
             if k1 in patients:
-                out.append((cand1, metadata))
+                out.append((f"{f2}, {f1}", metadata))
             elif k2 in patients:
-                out.append((cand2, metadata))
+                out.append((f"{f1}, {f2}", metadata))
             else:
-                out.append((cand1, metadata)) # default
+                out.append((f"{f2}, {f1}", metadata))
         elif len(words) == 3:
-            # Likely "Last First First"
             ln, f1, f2 = words[0], words[1], words[2]
             out.append((f"{ln}, {f1}", metadata))
             out.append((f"{ln}, {f2}", metadata))
         else:
-            # Fallback: try normalize_name_format (may produce "Last, First First...")
             norm = normalize_name_format(seg)
             if norm and "," in norm:
                 out.append((norm, metadata))
