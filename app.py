@@ -537,7 +537,9 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
     """
     clean_title, metadata = extract_metadata(title)
     clean_title = _clean_person_token(clean_title)
-
+    # ✅ Normalize & to "and" so both are handled identically
+    clean_title = re.sub(r'\s*&\s*', ' and ', clean_title)
+    
     names: List[Tuple[str, str]] = []
 
     def _normalize_two_word_name(segment: str) -> str:
@@ -629,7 +631,7 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
             )
 
         lname_hits = sum(_looks_like_lastname(t) for t in tokens)
-        if lname_hits >= max(3, len(tokens)):
+        if lname_hits >= len(tokens):
             return [(t, metadata) for t in tokens]
         if len(tokens) % 2 == 0:
             out = []
