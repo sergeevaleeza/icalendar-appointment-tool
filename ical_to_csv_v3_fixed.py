@@ -20,6 +20,9 @@ import unicodedata
 import re
 import logging.handlers  # Added for FileHandler
 
+# Set to your local timezone
+LOCAL_TZ = pytz.timezone("America/Los_Angeles")
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +49,12 @@ def _clean_person_token(s: str) -> str:
     s = _CLEAN_NOISE_RE.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def _to_local(dt: datetime, tz) -> datetime:
+    """Convert a UTC-aware datetime to local timezone."""
+    if dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    return dt.astimezone(tz)
 
 def _surname_key(s: str) -> str:
     n = _normalize_token(s)
@@ -152,29 +161,35 @@ def extract_appointments(calendar: Calendar, months: List[int], year: int) -> Li
                     end_of_year = datetime(year + 1, 1, 1, tzinfo=pytz.UTC)
                     
                     for occurrence in rule.between(start_of_year, end_of_year, inc=True):
-                        if is_monday_or_friday(occurrence) and is_in_target_months(occurrence, months, year):
-                            duration = end_datetime - event_datetime
-                            occurrence_end = occurrence + duration
-                            
+                        # ✅ Convert to local time BEFORE checking day/month and formatting
+                        local_occ = _to_local(occurrence, LOCAL_TZ)
+                        duration = end_datetime - event_datetime
+                        local_occ_end = _to_local(occurrence + duration, LOCAL_TZ)
+
+                        if is_monday_or_friday(local_occ) and is_in_target_months(local_occ, months, year):
                             appointments.append({
                                 'title': summary,
-                                'start_date': occurrence.strftime('%m/%d/%Y'),
-                                'start_time': occurrence.strftime('%H:%M'),
-                                'end_time': occurrence_end.strftime('%H:%M'),
-                                'day_of_week': occurrence.strftime('%A'),
+                                'start_date': local_occ.strftime('%m/%d/%Y'),
+                                'start_time': local_occ.strftime('%H:%M'),
+                                'end_time': local_occ_end.strftime('%H:%M'),
+                                'day_of_week': local_occ.strftime('%A'),
                                 'location': location,
                                 'description': description.replace('\n', ' ').replace('\r', '')
                             })
                 except Exception as e:
                     logger.warning(f"Could not process recurring event '{summary}': {str(e)}")
             else:
-                if is_monday_or_friday(event_datetime) and is_in_target_months(event_datetime, months, year):
+                # ✅ Convert to local time BEFORE checking day/month and formatting
+                local_dt = _to_local(event_datetime, LOCAL_TZ)
+                local_end = _to_local(end_datetime, LOCAL_TZ)
+
+                if is_monday_or_friday(local_dt) and is_in_target_months(local_dt, months, year):
                     appointments.append({
                         'title': summary,
-                        'start_date': event_datetime.strftime('%m/%d/%Y'),
-                        'start_time': event_datetime.strftime('%H:%M'),
-                        'end_time': end_datetime.strftime('%H:%M'),
-                        'day_of_week': event_datetime.strftime('%A'),
+                        'start_date': local_dt.strftime('%m/%d/%Y'),
+                        'start_time': local_dt.strftime('%H:%M'),
+                        'end_time': local_end.strftime('%H:%M'),
+                        'day_of_week': local_dt.strftime('%A'),
                         'location': location,
                         'description': description.replace('\n', ' ').replace('\r', '')
                     })
