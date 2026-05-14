@@ -547,14 +547,37 @@ def split_combined_names(title: str, patients: Dict[str, PatientData]) -> List[T
         return f"{f2}, {f1}"  # default: assume "First Last"
 
     # ✅ FIX 2: Handle "A and B" — now works for multi-word parts too
+    # Handle "A and B" splits
     if " and " in clean_title and "," not in clean_title:
         parts = [p.strip() for p in clean_title.split(" and ") if p.strip()]
         if len(parts) == 2:
+            p0_words = parts[0].split()
+            p1_words = parts[1].split()
+    
             if all(" " not in p for p in parts):
                 # Both single tokens -> two last names
                 return [(p, metadata) for p in parts]
+    
+            # ✅ "First and First Last" -> shared last name
+            # e.g. "Carlos and Guadalupe Tenorio" -> ["Carlos", "Guadalupe Tenorio"]
+            # one part is a single first name, other is "First Last"
+            elif len(p0_words) == 1 and len(p1_words) == 2:
+                shared_last = p1_words[1]
+                return [
+                    (f"{shared_last}, {p0_words[0]}", metadata),
+                    (f"{shared_last}, {p1_words[0]}", metadata),
+                ]
+            # ✅ "First Last and First" -> shared last name (reversed order)
+            # e.g. "Guadalupe Tenorio and Carlos" -> ["Guadalupe Tenorio", "Carlos"]
+            elif len(p0_words) == 2 and len(p1_words) == 1:
+                shared_last = p0_words[1]
+                return [
+                    (f"{shared_last}, {p0_words[0]}", metadata),
+                    (f"{shared_last}, {p1_words[0]}", metadata),
+                ]
+    
             else:
-                # Multi-word -> normalize each as a full name
+                # Multi-word both sides -> normalize each independently
                 result = []
                 for p in parts:
                     result.append((_normalize_two_word_name(p), metadata))
